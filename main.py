@@ -1,26 +1,26 @@
 import os
 import re
 import logging
-import asyncio
-from fastapi import FastAPI, Header, HTTPException, Request, BackgroundTasks
+import json
+from fastapi import FastAPI, Header, Request, BackgroundTasks, Response
 from groq import AsyncGroq 
 import httpx
 
 # --- SECURE CONFIGURATION ---
-# This tells Python: "Look for the key in the server's safe, not in this file."
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY") 
 MY_SECRET_PASSWORD = "guvi-hackathon-pass"
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
 # --- SETUP ---
 app = FastAPI()
-# Handle missing key gracefully
+
+# Handle missing key gracefully (prevents startup crashes)
 if GROQ_API_KEY:
     client = AsyncGroq(api_key=GROQ_API_KEY)
 else:
-    client = None # Will force emergency backup if key is missing
+    client = None 
 
-logging.basicConfig(level=logging.ERROR)
+# logging.basicConfig(level=logging.INFO) # maintain default logging
 session_store = {}
 
 # --- HELPER FUNCTIONS ---
@@ -33,13 +33,22 @@ def extract_intelligence(text: str) -> dict:
     }
 
 async def generate_ai_reply(history: list, current_msg: str) -> str:
-    # 1. Emergency Check: If no key, use backup immediately
+    # Emergency Backup if Key is missing or AI fails
+    fallback_phrases = [
+        "I am confused. My phone is acting up.",
+        "I don't understand technology. Please help.",
+        "Did you send this? I can't read it well.",
+        "My grandson handles this usually."
+    ]
+    
     if not client:
-        return "I am confused. My phone is acting up."
+        import random
+        return random.choice(fallback_phrases)
 
     system_prompt = "You are a confused grandma. Reply in 1 sentence."
     messages = [{"role": "system", "content": system_prompt}]
     
+    # Safe History Building
     for msg in history:
         if isinstance(msg, dict):
             role = "assistant" if msg.get("sender") == "agent" else "user"
@@ -47,7 +56,6 @@ async def generate_ai_reply(history: list, current_msg: str) -> str:
     messages.append({"role": "user", "content": current_msg})
 
     try:
-        # 2. Fast AI Call
         chat = await client.chat.completions.create(
             model="llama-3.1-8b-instant", 
             messages=messages, 
@@ -55,7 +63,8 @@ async def generate_ai_reply(history: list, current_msg: str) -> str:
         )
         return chat.choices[0].message.content
     except:
-        return "I don't understand technology. Please help."
+        import random
+        return random.choice(fallback_phrases)
 
 async def send_report(session_id, count, intel):
     payload = {
@@ -71,22 +80,38 @@ async def send_report(session_id, count, intel):
     except:
         pass
 
-# --- ENDPOINT ---
+# --- THE UNCRASHABLE ENDPOINT ---
 @app.post("/chat")
 async def chat_handler(request: Request, bg_tasks: BackgroundTasks, x_api_key: str = Header(None)):
+    # 1. AUTH CHECK (We keep this one)
     if x_api_key != MY_SECRET_PASSWORD:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        # Return 401 but log it
+        print(f"❌ Wrong Password: {x_api_key}")
+        return Response(content=json.dumps({"error": "Unauthorized"}), status_code=401, media_type="application/json")
 
+    # 2. BULLETPROOF DATA READING (No more 400 Errors!)
     try:
         body = await request.json()
     except:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        # If JSON fails, assume empty body instead of crashing
+        print("⚠️ Invalid JSON received, using empty body.")
+        body = {}
 
-    session_id = body.get("sessionId", "unknown")
+    # 3. SAFE DATA EXTRACTION (Never fails)
+    session_id = body.get("sessionId", "unknown_session")
     msg_obj = body.get("message", {})
-    incoming_text = msg_obj if isinstance(msg_obj, str) else msg_obj.get("text", "")
+    
+    # Handle weird message formats
+    if isinstance(msg_obj, str):
+        incoming_text = msg_obj
+    elif isinstance(msg_obj, dict):
+        incoming_text = msg_obj.get("text", "")
+    else:
+        incoming_text = ""
+
     history = body.get("conversationHistory", [])
     
+    # 4. PROCESS INTELLIGENCE
     intel = extract_intelligence(incoming_text)
     
     if session_id not in session_store:
@@ -96,9 +121,12 @@ async def chat_handler(request: Request, bg_tasks: BackgroundTasks, x_api_key: s
         session_store[session_id]["data"][k] += v
     session_store[session_id]["count"] += 1
 
+    # 5. GENERATE REPLY
     reply = await generate_ai_reply(history, incoming_text)
 
+    # 6. REPORT IN BACKGROUND
     if intel["phishingLinks"] or session_store[session_id]["count"] > 4:
         bg_tasks.add_task(send_report, session_id, session_store[session_id]["count"], session_store[session_id]["data"])
 
+    # 7. ALWAYS RETURN SUCCESS
     return {"status": "success", "reply": reply}
