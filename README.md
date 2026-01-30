@@ -76,3 +76,8 @@ This project is optimized for cloud deployment on **Render**.
   },
   "conversationHistory": []
 }
+```
+🛡️ Security Note-
+This project uses Environment Variables (os.environ.get) to manage sensitive API keys. No secrets are hardcoded in the source files, making it safe for public repositories.
+
+Created by AthulJenson for the GUVI Hackathon 2026.
