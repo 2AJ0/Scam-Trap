@@ -57,7 +57,7 @@ async def generate_ai_reply(history: list, current_msg: str) -> str:
 
     try:
         chat = await client.chat.completions.create(
-            model="llama-3.1-8b-instant", 
+            model="llama-3.3-70b-versatile",
             messages=messages, 
             max_tokens=50
         )
