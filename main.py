@@ -1,103 +1,137 @@
 import os
 import re
 import json
-import random
 from fastapi import FastAPI, Header, Request, BackgroundTasks, Response
-from groq import AsyncGroq 
+from groq import AsyncGroq
 import httpx
 
-# --- CONFIGURATION ---
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY") 
-MY_SECRET_PASSWORD = "guvi-hackathon-pass"
+# ---------------- CONFIG ----------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+API_KEY = "guvi-hackathon-pass"
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
 app = FastAPI()
 client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# In-memory session store (OK for hackathon)
 session_store = {}
 
-# --- INTELLIGENCE EXTRACTION ---
+# ---------------- INTELLIGENCE ----------------
 def extract_intelligence(text: str) -> dict:
     return {
-        "upiIds": re.findall(r'[\w\.-]+@[\w\.-]+', text),
+        "upiIds": re.findall(r'[\w\.-]+@[\w]+', text),
         "phoneNumbers": re.findall(r'(?:\+91|0)?[6-9]\d{9}', text),
         "phishingLinks": re.findall(r'https?://\S+|www\.\S+', text),
-        "suspiciousKeywords": [w for w in ["block", "urgent", "otp", "kyc", "verify"] if w in text.lower()]
+        "bankAccounts": re.findall(r'\b\d{9,18}\b', text),
+        "suspiciousKeywords": [
+            w for w in ["urgent", "blocked", "verify", "otp", "kyc"]
+            if w in text.lower()
+        ]
     }
 
-# --- AI BRAIN ---
+def is_scam(intel: dict, text: str) -> bool:
+    score = 0
+    if intel["upiIds"]: score += 2
+    if intel["phishingLinks"]: score += 2
+    if intel["phoneNumbers"]: score += 1
+    if intel["suspiciousKeywords"]: score += 1
+    return score >= 2
+
+# ---------------- AGENT ----------------
 async def generate_ai_reply(history: list, current_msg: str) -> str:
     if not client:
-        return "I am so confused with this phone. Can you help me slowly?"
+        return "I am not very good with phones, can you explain slowly?"
 
-    # Short, personality-driven prompt to prevent long loops
-    system_prompt = "You are a confused grandma. Keep your reply to exactly ONE short sentence. Be helpless."
+    system_prompt = (
+        "You are a confused non-technical user. "
+        "Reply with exactly ONE short sentence. "
+        "Ask for clarification politely."
+    )
+
     messages = [{"role": "system", "content": system_prompt}]
-    
-    # Add history safely
-    for msg in history[-3:]: # Only look at last 3 messages for speed
-        if isinstance(msg, dict):
-            m = msg.get("message", msg)
-            content = m.get("text", "") if isinstance(m, dict) else str(m)
-            sender = m.get("sender", "user") if isinstance(m, dict) else "user"
-            messages.append({"role": "assistant" if sender == "agent" else "user", "content": content})
-            
+
+    for msg in history[-3:]:
+        sender = msg.get("sender")
+        role = "assistant" if sender == "user" else "user"
+        messages.append({"role": role, "content": msg.get("text", "")})
+
     messages.append({"role": "user", "content": current_msg})
 
     try:
-        chat = await client.chat.completions.create(
-            model="llama-3.1-8b-instant", # High-speed model
-            messages=messages, 
-            max_tokens=40
+        resp = await client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            max_tokens=30
         )
-        return chat.choices[0].message.content
+        return resp.choices[0].message.content.strip()
     except:
-        return "Oh dear, the screen went blank. What was that again?"
+        return "Sorry, can you repeat that once?"
 
-# --- REPORTING ---
-async def send_report(session_id, count, intel):
+# ---------------- CALLBACK ----------------
+async def send_final_report(session_id: str, session: dict):
     payload = {
         "sessionId": session_id,
         "scamDetected": True,
-        "totalMessagesExchanged": count,
-        "extractedIntelligence": intel,
-        "agentNotes": "Scammer engagement successful. Intelligence extracted."
+        "totalMessagesExchanged": session["count"],
+        "extractedIntelligence": session["intel"],
+        "agentNotes": "Scammer used urgency and attempted credential extraction"
     }
-    try:
-        async with httpx.AsyncClient() as http_client:
-            await http_client.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
-    except:
-        pass
+    async with httpx.AsyncClient() as client:
+        await client.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
 
-# --- THE ENDPOINT ---
+# ---------------- API ----------------
 @app.post("/chat")
-async def chat_handler(request: Request, bg_tasks: BackgroundTasks, x_api_key: str = Header(None)):
-    if x_api_key != MY_SECRET_PASSWORD:
-        return Response(content=json.dumps({"status": "error", "message": "Unauthorized"}), status_code=401)
+async def chat_handler(
+    request: Request,
+    bg_tasks: BackgroundTasks,
+    x_api_key: str = Header(None)
+):
+    if x_api_key != API_KEY:
+        return Response(
+            content=json.dumps({"status": "error", "message": "Unauthorized"}),
+            status_code=401
+        )
 
-    try:
-        body = await request.json()
-    except:
-        body = {}
+    body = await request.json()
+    session_id = body.get("sessionId")
+    message = body.get("message", {})
+    text = message.get("text", "")
+    history = body.get("conversationHistory", [])
 
-    session_id = body.get("sessionId", "temp_session")
-    msg_data = body.get("message", {})
-    incoming_text = msg_data.get("text", "") if isinstance(msg_data, dict) else str(msg_data)
-    
-    # Process Stats
-    intel = extract_intelligence(incoming_text)
     if session_id not in session_store:
-        session_store[session_id] = {"count": 0, "intel": {"upiIds": [], "phoneNumbers": [], "phishingLinks": [], "suspiciousKeywords": []}}
-    
-    for k, v in intel.items():
-        session_store[session_id]["intel"][k] = list(set(session_store[session_id]["intel"][k] + v))
-    session_store[session_id]["count"] += 1
+        session_store[session_id] = {
+            "count": 0,
+            "reported": False,
+            "intel": {
+                "upiIds": [],
+                "phoneNumbers": [],
+                "phishingLinks": [],
+                "bankAccounts": [],
+                "suspiciousKeywords": []
+            }
+        }
 
-    # Generate AI Reply
-    reply = await generate_ai_reply(body.get("conversationHistory", []), incoming_text)
+    session = session_store[session_id]
+    session["count"] += 1
 
-    # Trigger reporting if scam confirmed or conversation is long enough
-    if len(intel["upiIds"]) > 0 or session_store[session_id]["count"] >= 3:
-        bg_tasks.add_task(send_report, session_id, session_store[session_id]["count"], session_store[session_id]["intel"])
+    intel = extract_intelligence(text)
+    for k in intel:
+        session["intel"][k] = list(set(session["intel"][k] + intel[k]))
 
-    # FINAL RESPONSE FORMAT (Matches GUVI Expectation)
-    return {"status": "success", "reply": reply}
+    scam_confirmed = is_scam(intel, text)
+
+    reply = await generate_ai_reply(history, text)
+
+    # Stop engagement after enough messages
+    if session["count"] >= 8:
+        reply = "I will visit my bank directly tomorrow."
+
+    # Final mandatory callback (ONLY ONCE)
+    if scam_confirmed and not session["reported"] and session["count"] >= 4:
+        session["reported"] = True
+        bg_tasks.add_task(send_final_report, session_id, session)
+
+    return {
+        "status": "success",
+        "reply": reply
+    }
