@@ -6,21 +6,19 @@ from fastapi import FastAPI, Header, Request, BackgroundTasks, Response
 from groq import AsyncGroq 
 import httpx
 
-# --- SECURE CONFIGURATION ---
+# --- CONFIGURATION ---
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY") 
 MY_SECRET_PASSWORD = "guvi-hackathon-pass"
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
-# --- SETUP ---
 app = FastAPI()
 
-# Handle missing key gracefully (prevents startup crashes)
+# Initialize Client safely
 if GROQ_API_KEY:
     client = AsyncGroq(api_key=GROQ_API_KEY)
 else:
     client = None 
 
-# logging.basicConfig(level=logging.INFO) # maintain default logging
 session_store = {}
 
 # --- HELPER FUNCTIONS ---
@@ -33,7 +31,6 @@ def extract_intelligence(text: str) -> dict:
     }
 
 async def generate_ai_reply(history: list, current_msg: str) -> str:
-    # Emergency Backup if Key is missing or AI fails
     fallback_phrases = [
         "I am confused. My phone is acting up.",
         "I don't understand technology. Please help.",
@@ -48,16 +45,32 @@ async def generate_ai_reply(history: list, current_msg: str) -> str:
     system_prompt = "You are a confused grandma. Reply in 1 sentence."
     messages = [{"role": "system", "content": system_prompt}]
     
-    # Safe History Building
+    # Robust History Handling
     for msg in history:
         if isinstance(msg, dict):
-            role = "assistant" if msg.get("sender") == "agent" else "user"
-            messages.append({"role": role, "content": msg.get("text", "")})
+            # Handle both simple and complex message structures
+            content = ""
+            role = "user"
+            
+            # Check for nested message object (like in the screenshot)
+            if "message" in msg and isinstance(msg["message"], dict):
+                content = msg["message"].get("text", "")
+                sender = msg["message"].get("sender", "user")
+                role = "assistant" if sender == "agent" else "user"
+            else:
+                # Flat structure fallback
+                content = msg.get("text", "")
+                sender = msg.get("sender", "user")
+                role = "assistant" if sender == "agent" else "user"
+                
+            if content:
+                messages.append({"role": role, "content": content})
+            
     messages.append({"role": "user", "content": current_msg})
 
     try:
         chat = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant", 
             messages=messages, 
             max_tokens=50
         )
@@ -80,38 +93,33 @@ async def send_report(session_id, count, intel):
     except:
         pass
 
-# --- THE UNCRASHABLE ENDPOINT ---
+# --- THE COMPATIBLE ENDPOINT ---
 @app.post("/chat")
 async def chat_handler(request: Request, bg_tasks: BackgroundTasks, x_api_key: str = Header(None)):
-    # 1. AUTH CHECK (We keep this one)
+    # 1. SECURITY CHECK
     if x_api_key != MY_SECRET_PASSWORD:
-        # Return 401 but log it
-        print(f"❌ Wrong Password: {x_api_key}")
         return Response(content=json.dumps({"error": "Unauthorized"}), status_code=401, media_type="application/json")
 
-    # 2. BULLETPROOF DATA READING (No more 400 Errors!)
+    # 2. ROBUST JSON PARSING
     try:
         body = await request.json()
     except:
-        # If JSON fails, assume empty body instead of crashing
-        print("⚠️ Invalid JSON received, using empty body.")
         body = {}
 
-    # 3. SAFE DATA EXTRACTION (Never fails)
+    # 3. EXTRACT FIELDS BASED ON SCREENSHOT FORMAT
     session_id = body.get("sessionId", "unknown_session")
-    msg_obj = body.get("message", {})
     
-    # Handle weird message formats
-    if isinstance(msg_obj, str):
-        incoming_text = msg_obj
-    elif isinstance(msg_obj, dict):
-        incoming_text = msg_obj.get("text", "")
+    # Handle the nested "message" object seen in your screenshot
+    # Request Body: { "message": { "text": "..." } }
+    message_data = body.get("message", {})
+    if isinstance(message_data, dict):
+        incoming_text = message_data.get("text", "")
     else:
-        incoming_text = ""
+        incoming_text = str(message_data)
 
     history = body.get("conversationHistory", [])
     
-    # 4. PROCESS INTELLIGENCE
+    # 4. INTELLIGENCE
     intel = extract_intelligence(incoming_text)
     
     if session_id not in session_store:
@@ -124,9 +132,9 @@ async def chat_handler(request: Request, bg_tasks: BackgroundTasks, x_api_key: s
     # 5. GENERATE REPLY
     reply = await generate_ai_reply(history, incoming_text)
 
-    # 6. REPORT IN BACKGROUND
+    # 6. REPORTING
     if intel["phishingLinks"] or session_store[session_id]["count"] > 4:
         bg_tasks.add_task(send_report, session_id, session_store[session_id]["count"], session_store[session_id]["data"])
 
-    # 7. ALWAYS RETURN SUCCESS
+    # 7. EXACT SUCCESS FORMAT REQUIRED
     return {"status": "success", "reply": reply}
